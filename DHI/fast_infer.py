@@ -14,6 +14,21 @@ from timer import Timer
 from utils import transformer as trans
 
 
+class AffineChannel2d(nn.Module):
+    """ A simple channel-wise affine transformation operation """
+    def __init__(self, num_features):
+        super().__init__()
+        self.num_features = num_features
+        self.weight = nn.Parameter(torch.Tensor(num_features))
+        self.bias = nn.Parameter(torch.Tensor(num_features))
+        self.weight.data.uniform_()
+        self.bias.data.zero_()
+
+    def forward(self, x):
+        return x * self.weight.view(1, self.num_features, 1, 1) + \
+            self.bias.view(1, self.num_features, 1, 1)
+
+
 def create_gif(image_list, gif_name, duration=0.35):
     frames = []
     for image_name in image_list:
@@ -61,8 +76,7 @@ class Test(object):
             model_dict[k.replace('module.', '')] = checkpoint[k]
         self.model.load_state_dict(model_dict)
 
-        self.model.cuda()
-        self.model.eval()
+        self.model.cuda().eval()
 
         M_tensor = torch.tensor([[args.img_w/ 2.0, 0., args.img_w/ 2.0],
                                 [0., args.img_h / 2.0, args.img_h / 2.0],
@@ -77,6 +91,12 @@ class Test(object):
         self.mean_I = np.reshape(np.array([118.93, 113.97, 102.60]), (1, 1, 3))
         self.std_I = np.reshape(np.array([69.85, 68.81, 72.45]), (1, 1, 3))
 
+        self.preproc = AffineChannel2d(3)
+        self.preproc.weight.data = torch.from_numpy(1. / np.array([69.85, 68.81, 72.45])).float()
+        self.preproc.bias.data = torch.from_numpy(-1. * np.array([118.93, 113.97, 102.60]) /
+                                                  np.array([69.85, 68.81, 72.45])).float()
+        self.preproc.cuda().eval()
+
         self.patch_h = args.patch_size_h
         self.patch_w = args.patch_size_w
         self.WIDTH = args.img_w
@@ -87,27 +107,25 @@ class Test(object):
     def __call__(self, img_1, img_2):
         self.timers['all_time'].tic()
         self.timers['data'].tic()
-        height, width = img_1.shape[:2]
-        if height != self.HEIGHT or width != self.WIDTH:
-            img_1 = cv2.resize(img_1, (self.WIDTH, self.HEIGHT))
+
+        img_1 = cv2.resize(img_1, (self.WIDTH, self.HEIGHT))
         print_img_1_d = img_1.copy()
-        img_1 = (img_1 - self.mean_I) / self.std_I
-        img_1 = np.mean(img_1, axis=2, keepdims=True)
-        img_1 = np.transpose(img_1, [2, 0, 1])
-
-        if height != self.HEIGHT or width != self.WIDTH:
-            img_2 = cv2.resize(img_2, (self.WIDTH, self.HEIGHT))
+        img_2 = cv2.resize(img_2, (self.WIDTH, self.HEIGHT))
         print_img_2_d = img_2.copy()
-        img_2 = (img_2 - self.mean_I) / self.std_I
-        img_2 = np.mean(img_2, axis=2, keepdims=True)
-        img_2 = np.transpose(img_2, [2, 0, 1])
-        org_img = np.concatenate([img_1, img_2], axis=0)
-        WIDTH = org_img.shape[2]
-        HEIGHT = org_img.shape[1]
 
+        img_1 = torch.from_numpy(img_1.transpose((2, 0, 1))).cuda().float()[None]
+        img_1 = self.preproc(img_1)
+        img_1 = torch.mean(img_1, dim=1, keepdim=True)
+        img_2 = torch.from_numpy(img_2.transpose((2, 0, 1))).cuda().float()[None]
+        img_2 = self.preproc(img_2)
+        img_2 = torch.mean(img_2, dim=1, keepdim=True)
+        org_img = torch.cat([img_1, img_2], dim=1)
+
+        WIDTH = org_img.shape[3]
+        HEIGHT = org_img.shape[2]
         x = 40  # patch should in the middle of full img when testing
         y = 23  # patch should in the middle of full img when testing
-        input_tesnor = org_img[:, y: y + self.patch_h, x: x + self.patch_w]
+        input_tesnor = org_img[:, :,  y: y + self.patch_h, x: x + self.patch_w]
 
         y_t_flat = np.reshape(self.y_mesh, [-1])
         x_t_flat = np.reshape(self.x_mesh, [-1])
@@ -121,8 +139,8 @@ class Test(object):
 
         four_points = np.reshape(four_points, (-1))
 
-        org_imges = torch.from_numpy(org_img[None]).float().cuda()
-        input_tesnors = torch.from_numpy(input_tesnor[None]).float().cuda()
+        # org_imges = torch.from_numpy(org_img[None]).float().cuda()
+        # input_tesnors = torch.from_numpy(input_tesnor[None]).float().cuda()
         patch_indices = torch.from_numpy(patch_indices[None]).float().cuda()
         h4p = torch.from_numpy(four_points[None]).float().cuda()
 
@@ -133,7 +151,7 @@ class Test(object):
         self.timers['data'].toc()
         
         self.timers['model'].tic()
-        batch_out = self.model(org_imges, input_tesnors, h4p, patch_indices)
+        batch_out = self.model(org_img, input_tesnor, h4p, patch_indices)
         H_mat = batch_out['H_mat']
         self.timers['model'].toc()
 
@@ -192,5 +210,5 @@ if __name__=="__main__":
     img_2 = cv2.imread('../images/00000238_10156.jpg')
     tt = Test(args)
     tt(img_1, img_2)
-    # for i in range(1000):
-    #     tt(img_1, img_2)
+    for i in range(1000):
+        tt(img_1, img_2)
