@@ -9,8 +9,8 @@ import os
 import torch
 import torch.nn as nn
 
+import resnet
 from timer import Timer
-from torch_homography_model import build_model
 from utils import transformer as trans
 
 
@@ -45,26 +45,24 @@ class Test(object):
         if not os.path.exists(self.result_files):
             os.makedirs(self.result_files)
 
-        self.net = build_model(args.model_name, pretrained=args.pretrained)
-        if args.finetune == True:
-            model_path = os.path.join(exp_name, 'models/freeze-mask-first-fintune.pth')
-            print(model_path)
-            state_dict = torch.load(model_path, map_location='cpu')
-            # create new OrderedDict that does not contain `module.`
-            from collections import OrderedDict
-            new_state_dict = OrderedDict()
-            for k, v in state_dict.state_dict().items():
-                namekey = k[7:]  # remove `module.`
-                new_state_dict[namekey] = v
-            # load params
-            self.net = build_model(args.model_name)
-            model_dict = self.net.state_dict()
-            new_state_dict = {k: v for k, v in new_state_dict.items() if k in model_dict.keys()}
-            model_dict.update(new_state_dict)
-            self.net.load_state_dict(model_dict)
+        self.model = resnet.resnet34()
+        self.model.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        self.model.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.model.fc = nn.Linear(512, 8)
 
-        print(self.net)
-        self.net = self.net.cuda()
+        print(self.model)
+
+        model_dict = self.model.state_dict()
+        model_path = os.path.join(exp_name, 'models/freeze-mask-first-fintune.pth')
+        checkpoint = torch.load(model_path, map_location='cpu').state_dict()
+        # because the model is trained by multiple gpus, prefix module should be removed
+        for k in checkpoint.keys():
+            model_dict[k.replace('module.', '')] = checkpoint[k]
+        self.model.load_state_dict(model_dict)
+
+        self.model.cuda()
+        self.model.eval()
 
         M_tensor = torch.tensor([[args.img_w/ 2.0, 0., args.img_w/ 2.0],
                                 [0., args.img_h / 2.0, args.img_h / 2.0],
@@ -75,7 +73,6 @@ class Test(object):
         # Inverse of M
         M_tensor_inv = torch.inverse(M_tensor)
         self.M_tile_inv = M_tensor_inv.unsqueeze(0).expand(1, M_tensor_inv.shape[-2], M_tensor_inv.shape[-1])
-        self.net.eval()
 
         self.mean_I = np.reshape(np.array([118.93, 113.97, 102.60]), (1, 1, 3))
         self.std_I = np.reshape(np.array([69.85, 68.81, 72.45]), (1, 1, 3))
@@ -135,10 +132,10 @@ class Test(object):
         print_img_2 = torch.from_numpy(print_img_2[None]).float().cuda()
         self.timers['data'].toc()
         
-        self.timers['net'].tic()
-        batch_out = self.net(org_imges, input_tesnors, h4p, patch_indices)
+        self.timers['model'].tic()
+        batch_out = self.model(org_imges, input_tesnors, h4p, patch_indices)
         H_mat = batch_out['H_mat']
-        self.timers['net'].toc()
+        self.timers['model'].toc()
 
         output_size = (self.HEIGHT, self.WIDTH)
 
@@ -195,5 +192,5 @@ if __name__=="__main__":
     img_2 = cv2.imread('../images/00000238_10156.jpg')
     tt = Test(args)
     tt(img_1, img_2)
-    for i in range(1000):
-        tt(img_1, img_2)
+    # for i in range(1000):
+    #     tt(img_1, img_2)
