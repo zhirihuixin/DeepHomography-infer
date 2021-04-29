@@ -9,6 +9,8 @@ import os
 
 import torch
 import torch.nn as nn
+from torch2trt import torch2trt
+from torch2trt import TRTModule
 
 import resnet
 from homography_model import ShareFeatureModel, GenMaskModel
@@ -88,6 +90,11 @@ class Test(object):
         if not os.path.exists(self.result_files):
             os.makedirs(self.result_files)
 
+        self.patch_h = args.patch_size_h
+        self.patch_w = args.patch_size_w
+        self.WIDTH = args.img_w
+        self.HEIGHT = args.img_h
+
         model_path = os.path.join(exp_name, 'models/freeze-mask-first-fintune.pth')
         self.model, self.sfmodel, self.gmmodel = self.initialize_model(model_path)
 
@@ -107,14 +114,11 @@ class Test(object):
                                                   np.array([69.85, 68.81, 72.45])).float()
         self.preproc.cuda().eval()
 
-        self.patch_h = args.patch_size_h
-        self.patch_w = args.patch_size_w
-        self.WIDTH = args.img_w
-        self.HEIGHT = args.img_h
         self.x_mesh, self.y_mesh = make_mesh(self.patch_w, self.patch_h)
         self.timers = defaultdict(Timer)
         
     def __call__(self, img_1, img_2):
+        torch.cuda.synchronize()
         self.timers['all_time'].tic()
         self.timers['data'].tic()
 
@@ -160,8 +164,8 @@ class Test(object):
         print_img_1 = torch.from_numpy(print_img_1[None]).float().cuda()
         print_img_2 = np.transpose(print_img_2_d, [2, 0, 1])
         print_img_2 = torch.from_numpy(print_img_2[None]).float().cuda()
+        torch.cuda.synchronize()
         self.timers['data'].toc()
-        
         self.timers['model'].tic()
         self.timers['gm_sf'].tic()
 
@@ -186,40 +190,45 @@ class Test(object):
         patch_2_res = torch.mul(patch_2, mask_I2)
         x = torch.cat((patch_1_res, patch_2_res), dim=1)
 
+        torch.cuda.synchronize()
         self.timers['gm_sf'].toc()
         self.timers['res34'].tic()
         x = self.model(x)
+        torch.cuda.synchronize()
         self.timers['res34'].toc()
         self.timers['DLT_solve'].tic()
         H_mat = DLT_solve(h4p, x).squeeze(1)
         # print(H_mat)
+        torch.cuda.synchronize()
         self.timers['DLT_solve'].toc()
         self.timers['model'].toc()
-
         output_size = (self.HEIGHT, self.WIDTH)
-
+        torch.cuda.synchronize()
         self.timers['post_process'].tic()
         H_mat = torch.matmul(torch.matmul(self.M_tile_inv, H_mat), self.M_tile)
         pred_full, _ = transformer(print_img_1, H_mat, output_size)  # pred_full = warped imgA
         pred_full = pred_full.cpu().detach().numpy()[0, ...]
         pred_full = pred_full.astype(np.uint8)
+        torch.cuda.synchronize()
         self.timers['post_process'].toc()
         self.timers['save_img'].tic()
         cv2.imwrite(os.path.join(self.result_files, "output.jpg"), pred_full)
+        torch.cuda.synchronize()
         self.timers['save_img'].toc()
 
-        # timers['make_gif'].tic()
+        # self.timers['make_gif'].tic()
         # pred_full = cv2.cvtColor(pred_full, cv2.COLOR_BGR2RGB)
         # print_img_1_d = cv2.cvtColor(print_img_1_d, cv2.COLOR_BGR2RGB)
         # print_img_2_d = cv2.cvtColor(print_img_2_d, cv2.COLOR_BGR2RGB)
 
         # input_list = [print_img_1_d, print_img_2_d]
         # output_list = [pred_full, print_img_2_d]
-        # create_gif(input_list, os.path.join(self.result_files, "_input_[" + self.result_name + "].gif"))
-        # create_gif(output_list, os.path.join(self.result_files, "_output_[" + self.result_name + "].gif"))
-        # timers['make_gif'].toc()
-        self.timers['all_time'].toc()
+        # create_gif(input_list, os.path.join(self.result_files, "input.gif"))
+        # create_gif(output_list, os.path.join(self.result_files, "output.gif"))
+        # self.timers['make_gif'].toc()
 
+        torch.cuda.synchronize()
+        self.timers['all_time'].toc()
         for k, v in self.timers.items():
             if k != 'all_time':
                 print(' | {}: {:.3f}s'.format(k, v.average_time))
@@ -256,7 +265,19 @@ class Test(object):
         gmmodel.load_state_dict(gmmodel_dict)
         gmmodel.cuda().eval()
 
-        return model, sfmodel, gmmodel
+        # return model, sfmodel, gmmodel
+
+        x = torch.ones((1, 1, self.HEIGHT, self.WIDTH)).cuda()
+        # convert to TensorRT feeding sample data as input
+        gmmodel_trt = torch2trt(gmmodel, [x], fp16_mode=True)
+        x = torch.ones((1, 1, self.patch_h, self.patch_w)).cuda()
+        # convert to TensorRT feeding sample data as input
+        sfmodel_trt = torch2trt(sfmodel, [x], fp16_mode=True)
+        x = torch.ones((1, 2, self.patch_h, self.patch_w)).cuda()
+        # convert to TensorRT feeding sample data as input
+        model_trt = torch2trt(model, [x], fp16_mode=True)
+
+        return model_trt, sfmodel_trt, gmmodel_trt
 
 
 if __name__=="__main__":
@@ -282,9 +303,21 @@ if __name__=="__main__":
     args = parser.parse_args()
     print(args)
 
-    img_1 = cv2.imread('../images/00000238_10153.jpg')
-    img_2 = cv2.imread('../images/00000238_10156.jpg')
+    # img_1 = cv2.imread('../images/00000238_10153.jpg')
+    # img_2 = cv2.imread('../images/00000238_10156.jpg')
+
+    img_1 = cv2.imread('../images/0000026_10001.jpg')
+    img_2 = cv2.imread('../images/0000026_10163.jpg')
+
+    # args.img_w = 2448
+    # args.img_h = 2048
+    args.img_w = 2448 // 2
+    args.img_h = 2048 // 2
+
+    args.patch_size_w = args.img_w * 7 // 8
+    args.patch_size_h = args.img_h * 7 // 8
+
     tt = Test(args)
     tt(img_1, img_2)
-    for i in range(1000):
-        tt(img_1, img_2)
+    # for i in range(1000):
+    #     tt(img_1, img_2)
