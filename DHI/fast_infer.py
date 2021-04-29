@@ -3,6 +3,7 @@ import argparse
 from collections import defaultdict
 import cv2
 import imageio
+import math
 import numpy as np
 import os
 
@@ -10,8 +11,9 @@ import torch
 import torch.nn as nn
 
 import resnet
+from homography_model import ShareFeatureModel, GenMaskModel
 from timer import Timer
-from utils import transformer as trans
+from utils import DLT_solve, transformer
 
 
 class AffineChannel2d(nn.Module):
@@ -27,6 +29,32 @@ class AffineChannel2d(nn.Module):
     def forward(self, x):
         return x * self.weight.view(1, self.num_features, 1, 1) + \
             self.bias.view(1, self.num_features, 1, 1)
+
+
+def getPatchFromFullimg(patch_size_h, patch_size_w, patchIndices, batch_indices_tensor, img_full):
+    num_batch, num_channels, height, width = img_full.size()
+    warped_images_flat = img_full.reshape(-1)
+    patch_indices_flat = patchIndices.reshape(-1)
+
+    pixel_indices = patch_indices_flat.long() + batch_indices_tensor
+    mask_patch = torch.gather(warped_images_flat, 0, pixel_indices)
+    mask_patch = mask_patch.reshape([num_batch, 1, patch_size_h, patch_size_w])
+
+    return mask_patch
+
+
+def normMask(mask, strenth = 0.5):
+    """
+    :return: to attention more region
+
+    """
+    batch_size, c_m, c_h, c_w = mask.size()
+    max_value = mask.reshape(batch_size, -1).max(1)[0]
+    max_value = max_value.reshape(batch_size, 1, 1, 1)
+    mask = mask/(max_value*strenth)
+    mask = torch.clamp(mask, 0, 1)
+
+    return mask
 
 
 def create_gif(image_list, gif_name, duration=0.35):
@@ -60,23 +88,8 @@ class Test(object):
         if not os.path.exists(self.result_files):
             os.makedirs(self.result_files)
 
-        self.model = resnet.resnet34()
-        self.model.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3,
-                               bias=False)
-        self.model.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.model.fc = nn.Linear(512, 8)
-
-        print(self.model)
-
-        model_dict = self.model.state_dict()
         model_path = os.path.join(exp_name, 'models/freeze-mask-first-fintune.pth')
-        checkpoint = torch.load(model_path, map_location='cpu').state_dict()
-        # because the model is trained by multiple gpus, prefix module should be removed
-        for k in checkpoint.keys():
-            model_dict[k.replace('module.', '')] = checkpoint[k]
-        self.model.load_state_dict(model_dict)
-
-        self.model.cuda().eval()
+        self.model, self.sfmodel, self.gmmodel = self.initialize_model(model_path)
 
         M_tensor = torch.tensor([[args.img_w/ 2.0, 0., args.img_w/ 2.0],
                                 [0., args.img_h / 2.0, args.img_h / 2.0],
@@ -87,9 +100,6 @@ class Test(object):
         # Inverse of M
         M_tensor_inv = torch.inverse(M_tensor)
         self.M_tile_inv = M_tensor_inv.unsqueeze(0).expand(1, M_tensor_inv.shape[-2], M_tensor_inv.shape[-1])
-
-        self.mean_I = np.reshape(np.array([118.93, 113.97, 102.60]), (1, 1, 3))
-        self.std_I = np.reshape(np.array([69.85, 68.81, 72.45]), (1, 1, 3))
 
         self.preproc = AffineChannel2d(3)
         self.preproc.weight.data = torch.from_numpy(1. / np.array([69.85, 68.81, 72.45])).float()
@@ -123,8 +133,10 @@ class Test(object):
 
         WIDTH = org_img.shape[3]
         HEIGHT = org_img.shape[2]
-        x = 40  # patch should in the middle of full img when testing
-        y = 23  # patch should in the middle of full img when testing
+        # x = 40  # patch should in the middle of full img when testing
+        # y = 23  # patch should in the middle of full img when testing
+        x = math.ceil((self.WIDTH - self.patch_w) / 2)
+        y = math.ceil((self.HEIGHT - self.patch_h) / 2)
         input_tesnor = org_img[:, :,  y: y + self.patch_h, x: x + self.patch_w]
 
         y_t_flat = np.reshape(self.y_mesh, [-1])
@@ -151,19 +163,50 @@ class Test(object):
         self.timers['data'].toc()
         
         self.timers['model'].tic()
-        batch_out = self.model(org_img, input_tesnor, h4p, patch_indices)
-        H_mat = batch_out['H_mat']
+        self.timers['gm_sf'].tic()
+
+        batch_size, _, img_h, img_w = org_img.size()
+        _, _, patch_size_h, patch_size_w = input_tesnor.size() 
+
+        y_t = torch.arange(0, batch_size * img_w * img_h,
+                           img_w * img_h)
+        batch_indices_tensor = y_t.unsqueeze(1).expand(y_t.shape[0], patch_size_h * patch_size_w).reshape(-1)
+        batch_indices_tensor = batch_indices_tensor.cuda()
+        mask_I1_full = self.gmmodel(org_img[:, :1, ...])
+        mask_I2_full = self.gmmodel(org_img[:, 1:, ...])
+
+        mask_I1 = getPatchFromFullimg(patch_size_h, patch_size_w, patch_indices, batch_indices_tensor, mask_I1_full)
+        mask_I2 = getPatchFromFullimg(patch_size_h, patch_size_w, patch_indices, batch_indices_tensor, mask_I2_full)
+        mask_I1 = normMask(mask_I1)
+        mask_I2 = normMask(mask_I2)
+        patch_1 = self.sfmodel(input_tesnor[:, :1, ...])
+        patch_2 = self.sfmodel(input_tesnor[:, 1:, ...])
+
+        patch_1_res = torch.mul(patch_1, mask_I1)
+        patch_2_res = torch.mul(patch_2, mask_I2)
+        x = torch.cat((patch_1_res, patch_2_res), dim=1)
+
+        self.timers['gm_sf'].toc()
+        self.timers['res34'].tic()
+        x = self.model(x)
+        self.timers['res34'].toc()
+        self.timers['DLT_solve'].tic()
+        H_mat = DLT_solve(h4p, x).squeeze(1)
+        # print(H_mat)
+        self.timers['DLT_solve'].toc()
         self.timers['model'].toc()
 
         output_size = (self.HEIGHT, self.WIDTH)
 
         self.timers['post_process'].tic()
         H_mat = torch.matmul(torch.matmul(self.M_tile_inv, H_mat), self.M_tile)
-        pred_full, _ = trans(print_img_1, H_mat, output_size)  # pred_full = warped imgA
+        pred_full, _ = transformer(print_img_1, H_mat, output_size)  # pred_full = warped imgA
         pred_full = pred_full.cpu().detach().numpy()[0, ...]
         pred_full = pred_full.astype(np.uint8)
-        cv2.imwrite(os.path.join(self.result_files, "output.jpg"), pred_full)
         self.timers['post_process'].toc()
+        self.timers['save_img'].tic()
+        cv2.imwrite(os.path.join(self.result_files, "output.jpg"), pred_full)
+        self.timers['save_img'].toc()
 
         # timers['make_gif'].tic()
         # pred_full = cv2.cvtColor(pred_full, cv2.COLOR_BGR2RGB)
@@ -181,6 +224,39 @@ class Test(object):
             if k != 'all_time':
                 print(' | {}: {:.3f}s'.format(k, v.average_time))
         print(' ------| {}: {:.3f}s'.format('all_time', self.timers['all_time'].average_time))
+
+    def initialize_model(self, model_path):
+        model = resnet.resnet34()
+        model.conv1 = nn.Conv2d(2, 64, kernel_size=7, stride=2, padding=3,
+                               bias=False)
+        model.avgpool = nn.AdaptiveAvgPool2d(1)
+        model.fc = nn.Linear(512, 8)
+        print(model)
+        model_dict = model.state_dict()
+
+        sfmodel = ShareFeatureModel()
+        sfmodel_dict = sfmodel.state_dict()
+
+        gmmodel = GenMaskModel()
+        gmmodel_dict = gmmodel.state_dict()
+
+        checkpoint = torch.load(model_path, map_location='cpu').state_dict()
+        # because the model is trained by multiple gpus, prefix module should be removed
+        for k in checkpoint.keys():
+            if 'ShareFeature' in k:
+                sfmodel_dict[k.replace('module.', '')] = checkpoint[k]
+            elif 'genMask' in k:
+                gmmodel_dict[k.replace('module.', '')] = checkpoint[k]
+            else:
+                model_dict[k.replace('module.', '')] = checkpoint[k]
+        model.load_state_dict(model_dict)
+        model.cuda().eval()
+        sfmodel.load_state_dict(sfmodel_dict)
+        sfmodel.cuda().eval()
+        gmmodel.load_state_dict(gmmodel_dict)
+        gmmodel.cuda().eval()
+
+        return model, sfmodel, gmmodel
 
 
 if __name__=="__main__":
