@@ -83,7 +83,7 @@ def make_mesh(patch_w,patch_h):
 
 
 class Test(object):
-    def __init__(self, args):
+    def __init__(self, args, img_2):
         exp_name = os.path.abspath(os.path.join(os.path.dirname("__file__"), os.path.pardir))
         self.result_name = "exp_fast"
         self.result_files = os.path.join(exp_name, self.result_name)
@@ -116,36 +116,27 @@ class Test(object):
 
         self.x_mesh, self.y_mesh = make_mesh(self.patch_w, self.patch_h)
         self.timers = defaultdict(Timer)
-        
-    def __call__(self, img_1, img_2):
-        torch.cuda.synchronize()
-        self.timers['all_time'].tic()
-        self.timers['data'].tic()
+        self.target_img(img_2)
 
-        img_1 = cv2.resize(img_1, (self.WIDTH, self.HEIGHT))
-        print_img_1_d = img_1.copy()
-        img_2 = cv2.resize(img_2, (self.WIDTH, self.HEIGHT))
+    def target_img(self, img_2):
         print_img_2_d = img_2.copy()
+        img_2 = cv2.resize(img_2, (self.WIDTH, self.HEIGHT))
+        # print_img_2_d = img_2.copy()
 
-        img_1 = torch.from_numpy(img_1.transpose((2, 0, 1))).cuda().float()[None]
-        img_1 = self.preproc(img_1)
-        img_1 = torch.mean(img_1, dim=1, keepdim=True)
         img_2 = torch.from_numpy(img_2.transpose((2, 0, 1))).cuda().float()[None]
         img_2 = self.preproc(img_2)
         img_2 = torch.mean(img_2, dim=1, keepdim=True)
-        org_img = torch.cat([img_1, img_2], dim=1)
 
-        WIDTH = org_img.shape[3]
-        HEIGHT = org_img.shape[2]
-        # x = 40  # patch should in the middle of full img when testing
-        # y = 23  # patch should in the middle of full img when testing
+        print_img_2 = np.transpose(print_img_2_d, [2, 0, 1])
+        print_img_2 = torch.from_numpy(print_img_2[None]).float().cuda()
+
         x = math.ceil((self.WIDTH - self.patch_w) / 2)
         y = math.ceil((self.HEIGHT - self.patch_h) / 2)
-        input_tesnor = org_img[:, :,  y: y + self.patch_h, x: x + self.patch_w]
+        input_tesnor_2 = img_2[:, :,  y: y + self.patch_h, x: x + self.patch_w]
 
         y_t_flat = np.reshape(self.y_mesh, [-1])
         x_t_flat = np.reshape(self.x_mesh, [-1])
-        patch_indices = (y_t_flat + y) * WIDTH + (x_t_flat + x)
+        patch_indices = (y_t_flat + y) * self.WIDTH + (x_t_flat + x)
 
         top_left_point = (x, y)
         bottom_left_point = (x, y + self.patch_h)
@@ -154,41 +145,58 @@ class Test(object):
         four_points = [top_left_point, bottom_left_point, bottom_right_point, top_right_point]
 
         four_points = np.reshape(four_points, (-1))
+        self.patch_indices = torch.from_numpy(patch_indices[None]).float().cuda()
+        self.h4p = torch.from_numpy(four_points[None]).float().cuda()
 
-        # org_imges = torch.from_numpy(org_img[None]).float().cuda()
-        # input_tesnors = torch.from_numpy(input_tesnor[None]).float().cuda()
-        patch_indices = torch.from_numpy(patch_indices[None]).float().cuda()
-        h4p = torch.from_numpy(four_points[None]).float().cuda()
+        y_t = torch.arange(0, self.WIDTH * self.HEIGHT,
+                           self.WIDTH * self.HEIGHT)
+        batch_indices_tensor = y_t.unsqueeze(1).expand(y_t.shape[0], self.patch_h * self.patch_w).reshape(-1)
+        self.batch_indices_tensor = batch_indices_tensor.cuda()
+
+        mask_I2_full = self.gmmodel(img_2)
+        mask_I2 = getPatchFromFullimg(
+            self.patch_h, self.patch_w, self.patch_indices, self.batch_indices_tensor, mask_I2_full
+        )
+        mask_I2 = normMask(mask_I2)
+        patch_2 = self.sfmodel(input_tesnor_2)
+        self.patch_2_res = torch.mul(patch_2, mask_I2)
+
+        self.print_img_2_d = cv2.cvtColor(print_img_2_d, cv2.COLOR_BGR2RGB)
+        
+    def __call__(self, img_1):
+        torch.cuda.synchronize()
+        self.timers['all_time'].tic()
+        self.timers['data'].tic()
+        print_img_1_d = img_1.copy()
+        img_1 = cv2.resize(img_1, (self.WIDTH, self.HEIGHT))
+        # print_img_1_d = img_1.copy()
+
+        img_1 = torch.from_numpy(img_1.transpose((2, 0, 1))).cuda().float()[None]
+        img_1 = self.preproc(img_1)
+        img_1 = torch.mean(img_1, dim=1, keepdim=True)
 
         print_img_1 = np.transpose(print_img_1_d, [2, 0, 1])
         print_img_1 = torch.from_numpy(print_img_1[None]).float().cuda()
-        print_img_2 = np.transpose(print_img_2_d, [2, 0, 1])
-        print_img_2 = torch.from_numpy(print_img_2[None]).float().cuda()
+
+        x = math.ceil((self.WIDTH - self.patch_w) / 2)
+        y = math.ceil((self.HEIGHT - self.patch_h) / 2)
+        input_tesnor_1 = img_1[:, :,  y: y + self.patch_h, x: x + self.patch_w]
+
         torch.cuda.synchronize()
         self.timers['data'].toc()
         self.timers['model'].tic()
         self.timers['gm_sf'].tic()
 
-        batch_size, _, img_h, img_w = org_img.size()
-        _, _, patch_size_h, patch_size_w = input_tesnor.size() 
-
-        y_t = torch.arange(0, batch_size * img_w * img_h,
-                           img_w * img_h)
-        batch_indices_tensor = y_t.unsqueeze(1).expand(y_t.shape[0], patch_size_h * patch_size_w).reshape(-1)
-        batch_indices_tensor = batch_indices_tensor.cuda()
-        mask_I1_full = self.gmmodel(org_img[:, :1, ...])
-        mask_I2_full = self.gmmodel(org_img[:, 1:, ...])
-
-        mask_I1 = getPatchFromFullimg(patch_size_h, patch_size_w, patch_indices, batch_indices_tensor, mask_I1_full)
-        mask_I2 = getPatchFromFullimg(patch_size_h, patch_size_w, patch_indices, batch_indices_tensor, mask_I2_full)
+        mask_I1_full = self.gmmodel(img_1)
+        
+        mask_I1 = getPatchFromFullimg(
+            self.patch_h, self.patch_w, self.patch_indices, self.batch_indices_tensor, mask_I1_full
+        )
         mask_I1 = normMask(mask_I1)
-        mask_I2 = normMask(mask_I2)
-        patch_1 = self.sfmodel(input_tesnor[:, :1, ...])
-        patch_2 = self.sfmodel(input_tesnor[:, 1:, ...])
+        patch_1 = self.sfmodel(input_tesnor_1)
 
         patch_1_res = torch.mul(patch_1, mask_I1)
-        patch_2_res = torch.mul(patch_2, mask_I2)
-        x = torch.cat((patch_1_res, patch_2_res), dim=1)
+        x = torch.cat((patch_1_res, self.patch_2_res), dim=1)
 
         torch.cuda.synchronize()
         self.timers['gm_sf'].toc()
@@ -197,12 +205,12 @@ class Test(object):
         torch.cuda.synchronize()
         self.timers['res34'].toc()
         self.timers['DLT_solve'].tic()
-        H_mat = DLT_solve(h4p, x).squeeze(1)
+        H_mat = DLT_solve(self.h4p, x).squeeze(1)
         # print(H_mat)
         torch.cuda.synchronize()
         self.timers['DLT_solve'].toc()
         self.timers['model'].toc()
-        output_size = (self.HEIGHT, self.WIDTH)
+        output_size = (self.HEIGHT * 2, self.WIDTH * 2)
         torch.cuda.synchronize()
         self.timers['post_process'].tic()
         H_mat = torch.matmul(torch.matmul(self.M_tile_inv, H_mat), self.M_tile)
@@ -211,20 +219,21 @@ class Test(object):
         pred_full = pred_full.astype(np.uint8)
         torch.cuda.synchronize()
         self.timers['post_process'].toc()
-        self.timers['save_img'].tic()
-        cv2.imwrite(os.path.join(self.result_files, "output.jpg"), pred_full)
-        torch.cuda.synchronize()
-        self.timers['save_img'].toc()
+        # self.timers['save_img'].tic()
+        # cv2.imwrite(os.path.join(self.result_files, "output.jpg"), pred_full)
+        # torch.cuda.synchronize()
+        # self.timers['save_img'].toc()
 
         # self.timers['make_gif'].tic()
         # pred_full = cv2.cvtColor(pred_full, cv2.COLOR_BGR2RGB)
         # print_img_1_d = cv2.cvtColor(print_img_1_d, cv2.COLOR_BGR2RGB)
-        # print_img_2_d = cv2.cvtColor(print_img_2_d, cv2.COLOR_BGR2RGB)
 
-        # input_list = [print_img_1_d, print_img_2_d]
-        # output_list = [pred_full, print_img_2_d]
+        # input_list = [print_img_1_d, self.print_img_2_d]
+        # output_list = [pred_full, self.print_img_2_d]
+        # change_list = [pred_full, print_img_1_d]
         # create_gif(input_list, os.path.join(self.result_files, "input.gif"))
         # create_gif(output_list, os.path.join(self.result_files, "output.gif"))
+        # create_gif(change_list, os.path.join(self.result_files, "change.gif"))
         # self.timers['make_gif'].toc()
 
         torch.cuda.synchronize()
@@ -306,18 +315,16 @@ if __name__=="__main__":
     # img_1 = cv2.imread('../images/00000238_10153.jpg')
     # img_2 = cv2.imread('../images/00000238_10156.jpg')
 
-    img_1 = cv2.imread('../images/0000026_10001.jpg')
-    img_2 = cv2.imread('../images/0000026_10163.jpg')
+    img_1 = cv2.imread('../images/0000026_10028.jpg')
+    img_2 = cv2.imread('../images/0000026_10001.jpg')
 
-    # args.img_w = 2448
-    # args.img_h = 2048
     args.img_w = 2448 // 2
     args.img_h = 2048 // 2
 
     args.patch_size_w = args.img_w * 7 // 8
     args.patch_size_h = args.img_h * 7 // 8
 
-    tt = Test(args)
-    tt(img_1, img_2)
-    # for i in range(1000):
-    #     tt(img_1, img_2)
+    tt = Test(args, img_2)
+    tt(img_1)
+    for i in range(1000):
+        tt(img_1)
