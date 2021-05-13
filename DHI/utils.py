@@ -104,11 +104,11 @@ def transformer(U, theta, out_size, **kwargs):
 
     def _repeat(x, n_repeats):
 
-        rep = torch.ones([n_repeats, ]).unsqueeze(0)
-        rep = rep.int()
-        x = x.int()
+        rep = torch.ones([n_repeats, ]).cuda().unsqueeze(0)
+        # rep = rep.int()
+        # x = x.int()
 
-        x = torch.matmul(x.reshape([-1,1]), rep)
+        x = torch.matmul(x.reshape([-1,1]).float(), rep)
         return x.reshape([-1])
 
     def _interpolate(im, x, y, out_size, scale_h):
@@ -128,27 +128,27 @@ def transformer(U, theta, out_size, **kwargs):
             y = (y + 1.0) * (height_f) / 2.0
 
         # do sampling
-        x0 = torch.floor(x).int()
+        x0 = torch.floor(x).int().cuda()
         x1 = x0 + 1
-        y0 = torch.floor(y).int()
+        y0 = torch.floor(y).int().cuda()
         y1 = y0 + 1
 
         x0 = torch.clamp(x0, zero, max_x)
         x1 = torch.clamp(x1, zero, max_x)
         y0 = torch.clamp(y0, zero, max_y)
         y1 = torch.clamp(y1, zero, max_y)
-        dim2 = torch.from_numpy( np.array(width) )
-        dim1 = torch.from_numpy( np.array(width * height) )
+        dim2 = torch.from_numpy( np.array(width) ).cuda()
+        dim1 = torch.from_numpy( np.array(width * height) ).cuda()
 
-        base = _repeat(torch.arange(0,num_batch) * dim1, out_height * out_width)
-        if torch.cuda.is_available():
-            dim2 = dim2.cuda()
-            dim1 = dim1.cuda()
-            y0 = y0.cuda()
-            y1 = y1.cuda()
-            x0 = x0.cuda()
-            x1 = x1.cuda()
-            base = base.cuda()
+        base = _repeat(torch.arange(0,num_batch).cuda() * dim1, out_height * out_width)
+        # if torch.cuda.is_available():
+        #     dim2 = dim2.cuda()
+        #     dim1 = dim1.cuda()
+        #     y0 = y0.cuda()
+        #     y1 = y1.cuda()
+        #     x0 = x0.cuda()
+        #     x1 = x1.cuda()
+        #     base = base.cuda()
         base_y0 = base + y0 * dim2
         base_y1 = base + y1 * dim2
         idx_a = base_y0 + x0
@@ -192,15 +192,15 @@ def transformer(U, theta, out_size, **kwargs):
     def _meshgrid(height, width, scale_h):
 
         if scale_h:
-            x_t = torch.matmul(torch.ones([height, 1]),
-                               torch.transpose(torch.unsqueeze(torch.linspace(-1.0, 1.0, width), 1), 1, 0))
-            y_t = torch.matmul(torch.unsqueeze(torch.linspace(-1.0, 1.0, height), 1),
-                               torch.ones([1, width]))
+            x_t = torch.matmul(torch.ones([height, 1]).cuda(),
+                               torch.transpose(torch.unsqueeze(torch.linspace(-1.0, 1.0, width).cuda(), 1), 1, 0))
+            y_t = torch.matmul(torch.unsqueeze(torch.linspace(-1.0, 1.0, height).cuda(), 1),
+                               torch.ones([1, width]).cuda())
         else:
             x_t = torch.matmul(torch.ones([height, 1]),
-                               torch.transpose(torch.unsqueeze(torch.linspace(0.0, width.float(), width), 1), 1, 0))
-            y_t = torch.matmul(torch.unsqueeze(torch.linspace(0.0, height.float(), height), 1),
-                               torch.ones([1, width]))
+                               torch.transpose(torch.unsqueeze(torch.linspace(0.0, width.float(), width).cuda(), 1), 1, 0))
+            y_t = torch.matmul(torch.unsqueeze(torch.linspace(0.0, height.float(), height).cuda(), 1),
+                               torch.ones([1, width]).cuda())
 
 
         x_t_flat = x_t.reshape((1, -1)).float()
@@ -208,8 +208,8 @@ def transformer(U, theta, out_size, **kwargs):
 
         ones = torch.ones_like(x_t_flat)
         grid = torch.cat([x_t_flat, y_t_flat, ones], 0)
-        if torch.cuda.is_available():
-            grid = grid.cuda()
+        # if torch.cuda.is_available():
+        #     grid = grid.cuda()
         return grid
 
     def _transform(theta, input_dim, out_size, scale_h):

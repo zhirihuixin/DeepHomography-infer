@@ -185,7 +185,7 @@ class Test(object):
         img_1 = torch.mean(img_1, dim=1, keepdim=True)
 
         print_img_1 = np.transpose(print_img_1_d, [2, 0, 1])
-        print_img_1 = torch.from_numpy(print_img_1[None]).float().cuda()
+        print_img_1 = torch.from_numpy(print_img_1).cuda().float()[None]
 
         x = math.ceil((self.WIDTH - self.patch_w) / 2)
         y = math.ceil((self.HEIGHT - self.patch_h) / 2)
@@ -232,8 +232,9 @@ class Test(object):
         #         (w, h)
         #     )
         H_mat = torch.matmul(torch.matmul(self.M_tile_inv, H_mat), self.M_tile)
+        # print(H_mat)
         pred_full, _ = transformer(print_img_1, H_mat, (h, w))  # pred_full = warped imgA
-        pred_full = pred_full.cpu().detach().numpy()[0, ...]
+        pred_full = pred_full[0].type(torch.uint8).cpu().numpy()
         pred_full = pred_full.astype(np.uint8)
         torch.cuda.synchronize()
         self.timers['post_process'].toc()
@@ -331,19 +332,21 @@ if __name__=="__main__":
     args = parser.parse_args()
     print(args)
 
-    img_1 = cv2.imread('../images/00000238_10153.jpg')
-    img_2 = cv2.imread('../images/00000238_10156.jpg')
+    # img_1 = cv2.imread('../images/00000238_10153.jpg')
+    # img_2 = cv2.imread('../images/00000238_10156.jpg')
 
-    # img_1 = cv2.imread('../images/0000026_10028.jpg')
-    # img_2 = cv2.imread('../images/0000026_10001.jpg')
+    img_1 = cv2.imread('../images/0000026_10028.jpg')
+    img_2 = cv2.imread('../images/0000026_10001.jpg')
 
-    # args.img_w = 2448 // 2
-    # args.img_h = 2048 // 2
-
-    # args.patch_size_w = args.img_w * 7 // 8
-    # args.patch_size_h = args.img_h * 7 // 8
+    args.img_w = 2448 // 1
+    args.img_h = 2048 // 1
+    args.patch_size_w = args.img_w * 7 // 8
+    args.patch_size_h = args.img_h * 7 // 8
+    args.half_size = False
+    args.use_trt = True
+    args.save_img = False
 
     tt = Test(args, img_2)
     tt(img_1)
-    # for i in range(1000):
-    #     tt(img_1)
+    for i in range(1000):
+        tt(img_1)
