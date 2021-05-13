@@ -97,6 +97,7 @@ class Test(object):
         self.half_size = args.half_size
         self.use_trt = args.use_trt
         self.save_img = args.save_img
+        self.cv2_process = args.cv2_process
 
         model_path = os.path.join(exp_name, 'models/freeze-mask-first-fintune.pth')
         self.model, self.sfmodel, self.gmmodel = self.initialize_model(model_path)
@@ -132,9 +133,6 @@ class Test(object):
         img_2 = torch.from_numpy(img_2.transpose((2, 0, 1))).cuda().float()[None]
         img_2 = self.preproc(img_2)
         img_2 = torch.mean(img_2, dim=1, keepdim=True)
-
-        print_img_2 = np.transpose(print_img_2_d, [2, 0, 1])
-        print_img_2 = torch.from_numpy(print_img_2[None]).float().cuda()
 
         x = math.ceil((self.WIDTH - self.patch_w) / 2)
         y = math.ceil((self.HEIGHT - self.patch_h) / 2)
@@ -184,8 +182,9 @@ class Test(object):
         img_1 = self.preproc(img_1)
         img_1 = torch.mean(img_1, dim=1, keepdim=True)
 
-        print_img_1 = np.transpose(print_img_1_d, [2, 0, 1])
-        print_img_1 = torch.from_numpy(print_img_1).cuda().float()[None]
+        if not self.cv2_process:
+            print_img_1 = np.transpose(print_img_1_d, [2, 0, 1])
+            print_img_1 = torch.from_numpy(print_img_1).cuda().float()[None]
 
         x = math.ceil((self.WIDTH - self.patch_w) / 2)
         y = math.ceil((self.HEIGHT - self.patch_h) / 2)
@@ -227,15 +226,21 @@ class Test(object):
             h = self.HEIGHT
         torch.cuda.synchronize()
         self.timers['post_process'].tic()
-        # pred_full = cv2.warpPerspective(
-        #         print_img_1_d, H_mat.cpu().detach().numpy()[0], 
-        #         (w, h)
-        #     )
-        H_mat = torch.matmul(torch.matmul(self.M_tile_inv, H_mat), self.M_tile)
-        # print(H_mat)
-        pred_full, _ = transformer(print_img_1, H_mat, (h, w))  # pred_full = warped imgA
-        pred_full = pred_full[0].type(torch.uint8).cpu().numpy()
-        pred_full = pred_full.astype(np.uint8)
+
+        if self.cv2_process:
+            H_point = H_mat.squeeze(0)
+            H_point = H_point.cpu().detach().numpy()
+            H_point = np.linalg.inv(H_point)
+            H_point = (1.0 / H_point.item(8)) * H_point
+            pred_full = cv2.warpPerspective(
+                    print_img_1_d, H_point, 
+                    (w, h)
+                )
+        else:
+            H_mat = torch.matmul(torch.matmul(self.M_tile_inv, H_mat), self.M_tile)
+            pred_full, _ = transformer(print_img_1, H_mat, (h, w))  # pred_full = warped imgA
+            pred_full = pred_full[0].type(torch.uint8).cpu().numpy()
+            pred_full = pred_full.astype(np.uint8)
         torch.cuda.synchronize()
         self.timers['post_process'].toc()
         if self.save_img:
@@ -326,6 +331,7 @@ if __name__=="__main__":
     parser.add_argument('--half_size', type=bool, default=False, help='Use half size inference?')
     parser.add_argument('--use_trt', type=bool, default=False, help='Use tensorRT?')
     parser.add_argument('--save_img', type=bool, default=True, help='save png and gif?')
+    parser.add_argument('--cv2_process', type=bool, default=False, help='cv2 process?')
 
     print('<==================== Loading data ===================>\n')
 
@@ -345,6 +351,7 @@ if __name__=="__main__":
     args.half_size = False
     args.use_trt = True
     args.save_img = False
+    args.cv2_process = False
 
     tt = Test(args, img_2)
     tt(img_1)
